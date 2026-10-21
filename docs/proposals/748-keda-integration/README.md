@@ -13,6 +13,7 @@
     - [Limitations/Risks \& Mitigations](#limitationsrisks--mitigations)
       - [Optional KEDA dependency with restart constraint](#optional-keda-dependency-with-restart-constraint)
       - [Provider switch introduces transient requeue cycles](#provider-switch-introduces-transient-requeue-cycles)
+      - [Scaling blocked during coherent update](#scaling-blocked-during-coherent-update)
       - [User-managed HPA coexistence](#user-managed-hpa-coexistence)
   - [Design Details](#design-details)
     - [API Changes](#api-changes)
@@ -60,6 +61,7 @@ Grove's existing HPA backend supports resource, custom, and external metrics thr
 
 * Automatic KEDA installation.
 * Detecting or blocking conflicts between user-managed HPAs and Grove-managed or KEDA-managed HPAs (consistent with existing `Provider=HPA` behavior).
+* Detecting or blocking conflicts between user-managed `ScaledObjects` and Grove-managed `ScaledObjects` targeting the same resource (consistent with the non-detection policy for user-managed HPAs).
 
 ## Proposal
 
@@ -75,11 +77,19 @@ KEDA scaling status is propagated to `PodCliqueSet.Status.Conditions` through a 
 
 #### Story 1: PD group scaling with normalized pressure
 
-As an AI platform engineer, I want to scale a disaggregated inference `PodCliqueScalingGroup` — where each replica is a fixed-ratio P+D group — by combining prefill and decode vLLM queue signals through a composite formula that normalizes each side against its own capacity target before taking the maximum, so that a prefill bottleneck is not masked by an idle decode tier and the group count always reflects the true system pressure.
+As an AI platform engineer, I operate a disaggregated inference fleet where each `PodCliqueScalingGroup` replica is a fixed-ratio prefill + decode group. The system pressure is not a single number: prefill queue depth and decode queue depth each need to be normalized against their own capacity targets, and the group count should reflect the maximum of the two so that a prefill bottleneck is never masked by an idle decode tier.
+
+HPA can evaluate multiple metrics and use the largest replica recommendation, so this max-based policy is possible when each queue metric is already exposed with an appropriate target. The challenge is expressing the normalization and combination logic directly from the raw queue signals; with HPA, I would need those metrics exposed in target-ready form or computed upstream.
+
+With KEDA's Prometheus triggers and `scalingModifiers`, I can define each queue's pressure relative to its capacity target and combine them with `max(prefillPressure, decodePressure)` directly in the `ScaledObject`. KEDA evaluates the formula on each polling interval, so I do not need a separate component to compute and publish the derived pressure metric.
 
 #### Story 2: SLO-aware scaling with a composite latency formula
 
-As a platform operator, I want an inference `PodCliqueScalingGroup` to scale against latency SLOs — keeping P90 time-to-first-token and P90 time-per-output-token within defined targets — by driving replica count from a composite formula over multiple Prometheus signals derived from vLLM's native histogram metrics, so that the pool reacts to real latency headroom rather than proxy queue signals.
+As a platform operator, I want an inference `PodCliqueScalingGroup` to scale based on latency headroom rather than proxy queue depth. Concretely, I want to hold P90 time-to-first-token under 200 ms and P90 time-per-output-token under 50 ms simultaneously, scaling out when either SLO is at risk and scaling in only when both have recovered.
+
+HPA scales proportionally (current / target ratio), which does not fit threshold-based SLOs. Expressing "scale out when P90 TTFT exceeds 200 ms" requires reshaping the latency signal into a utilization ratio before HPA can act on it.
+
+With KEDA, I use Prometheus queries over vLLM's histograms to expose P90 TTFT and P90 TPOT in seconds as named triggers `ttft` and `tpot`. I combine them into a single `scalingModifiers` formula, `max(ttft / 0.2, tpot / 0.05)`, with a target of `1` and metric type `Value`. The composite metric exceeds its target when either SLO is breached and falls below it only when both latencies are below their respective limits. KEDA supplies this metric to HPA for proportional scaling, subject to the configured scaling behavior and stabilization windows, without a separate component to compute and publish the composite metric.
 
 ### Limitations/Risks & Mitigations
 
@@ -90,6 +100,12 @@ The `Owns(ScaledObject)` watch is registered once at `SetupWithManager` time and
 #### Provider switch introduces transient requeue cycles
 
 Switching from `Provider=HPA` to `Provider=KEDA` (or vice versa) requires at least one extra reconcile cycle before the new resource appears. The `KEDA → HPA` direction may require multiple cycles while KEDA's controller clears its internal HPA finalizer. 
+
+#### Scaling blocked during coherent update
+
+Grove's `scaleguard` admission webhook rejects any `spec.replicas` write — including writes issued by KEDA through the `/scale` subresource — while a coherent update is in progress on the owning `PodCliqueSet`. KEDA scaling is therefore paused for the duration of the update and resumes automatically once the update completes. This is identical to the behavior of the existing HPA backend and is intentional: scaling mid-update could race with the rolling template change. Workloads that require continuous scaling during updates should not use the coherent update feature.
+
+Additionally, KEDA's fallback replica count must be 0 or `>= MinAvailable` on the target component (enforced by `validateKEDAFallback`). A fallback value in `(0, MinAvailable)` would cause KEDA's fallback write to be rejected by `scaleguard`, making the fallback non-functional. This constraint matches the existing `scaleguard` rule applied to all `spec.replicas` writes.
 
 #### User-managed HPA coexistence
 
@@ -218,6 +234,8 @@ if r.scaledObjectExistsForHPATargets(ctx, expectedTargets, pcs.Namespace) {
 }
 ```
 
+`scaledObjectExistsForHPATargets` treats a `meta.IsNoMatchError` response (KEDA CRD absent) as equivalent to "no ScaledObjects exist" and returns `false`, allowing the barrier to clear immediately. This prevents a dead loop when the user switches back to `Provider=HPA` in a cluster where KEDA was never installed.
+
 Each direction requires at least one extra reconcile cycle. The KEDA → HPA direction may require multiple cycles while KEDA clears its internal HPA finalizer.
 
 ### ScaledObject Construction
@@ -287,11 +305,11 @@ func (r _resource) buildResource(pcs *grovecorev1alpha1.PodCliqueSet,
 
 #### Write boundary
 
-G2 components run concurrently and share the same PCS object. To avoid concurrent writes to `PCS.Status.Conditions`, the KEDA operator's `Sync` method does not write to PCS status directly. Instead, a new serial step `reconcileKEDAStatus` runs after the full `syncPodCliqueSetResources` pass. It reads all `ScaledObject` statuses and patches `PCS.Status.Conditions` in one atomic write, mirroring the pattern used by other `reconcileStatus` steps in Grove controllers.
+G2 components run concurrently and share the same PCS object. To avoid concurrent writes to `PCS.Status.Conditions`, the KEDA operator's `Sync` method does not write to PCS status directly. Instead, a new `mutateKEDACondition` step is added inside the existing `reconcileStatus` function (in `reconcilestatus.go`), alongside `mutateUpdateInProgressCondition` and `mutateTopologyLevelUnavailableConditions`. This reuses the existing snapshot → mutate → single `Status().Update()` pattern: all condition mutations accumulate in memory and are flushed in one atomic write at the end of `reconcileStatus`.
 
 #### `KEDAScalingReady` condition
 
-`reconcileKEDAStatus` enumerates all `ScaledObjects` owned by the PCS and aggregates their readiness:
+`mutateKEDACondition` enumerates all `ScaledObjects` owned by the PCS and aggregates their readiness:
 
 | ScaledObject state | Condition contribution |
 |---|---|
